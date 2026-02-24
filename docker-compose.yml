@@ -1,0 +1,17 @@
+services:
+  kalshi-arb-bot:
+    build: .
+    container_name: kalshi-arb-bot
+    restart: unless-stopped
+    environment:
+      # These variables will be read from the .env file in the same directory,
+      # or from the host environment if they are exported on the server.
+      - KALSHI_KEY_ID=${KALSHI_KEY_ID}
+      - KALSHI_PRIVATE_KEY=${KALSHI_PRIVATE_KEY}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+    env_file: .env
+
+    # Optional: You can override the CMD here if you want to tweak parameters
+    # without rebuilding the image
+    # command: ["uv", "run", "python", "kalshi_arb.py", "watch", "--max-hours", "1", "--reset-int", "0.5", "--stake", "1", "--trade"]

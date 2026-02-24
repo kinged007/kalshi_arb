@@ -1,0 +1,13 @@
+[project]
+name = "kalshi-arb"
+version = "0.1.0"
+description = "Simple Kalshi Arbitrage Monitor"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aiohttp>=3.13.3",
+    "cryptography>=46.0.5",
+    "desktop-notifier>=6.2.0",
+    "python-dotenv>=1.2.1",
+    "websockets>=16.0",
+]
