@@ -102,7 +102,6 @@ def main():
             ts = get_max_close_ts()
             if ts:
                 params["max_close_ts"] = ts
-                print(f"Fetching open markets for series {st} with max_close_ts {ts}")
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, params=params) as resp:
                     data = await resp.json()
@@ -138,7 +137,6 @@ def main():
             ts = get_max_close_ts()
             if ts:
                 params["max_close_ts"] = ts
-            print(url,params)
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, params=params) as resp:
                     data = await resp.json()
@@ -169,9 +167,7 @@ def main():
                 all_tickers = []
                 series_mapping = {}
                 requested_groups = []
-                print(f"series_tickers: {series_tickers}")
-                print(f"tags: {tags}")
-                print(f"categories: {categories}")
+
                 for st in series_tickers:
                     req_id = f"series:{st}"
                     requested_groups.append(req_id)
