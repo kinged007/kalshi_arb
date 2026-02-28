@@ -1,162 +1,81 @@
-import argparse
 import asyncio
-import json
-import logging
-from kalshi_auth import get_auth_headers
-from kalshi_trade import place_order
-import websockets
-from websockets.exceptions import ConnectionClosed
+import aiohttp
+import sys
+import os
+
 from dotenv import load_dotenv
+
+# Appending to sys.path so we can import src module safely.
+sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
+from poly_trade import place_order
 
 load_dotenv()
 
-logger = logging.getLogger(__name__)
-
-class KalshiTestTradeMonitor:
-    def __init__(self, ticker: str):
-        self.ticker = ticker
-        self.uri = "wss://api.elections.kalshi.com/trade-api/ws/v2"
-        self.yes_book = {}
-        self.no_book = {}
-
-    async def connect_and_trade(self):
-        headers = get_auth_headers("GET", "/trade-api/ws/v2")
-        
-        async def trade_after_delay():
-            print("⏳ Waiting 5 seconds to accumulate orderbook...")
-            await asyncio.sleep(5)
-            await self.execute_trade()
-            # Cancel the websocket task to exit
-            try:
-                self.ws_task.cancel()
-            except:
-                pass
-
-        self.trade_task = asyncio.create_task(trade_after_delay())
-
-        async for websocket in websockets.connect(self.uri, additional_headers=headers):
-            try:
-                sub_msg = {
-                    "id": 1,
-                    "cmd": "subscribe",
-                    "params": {
-                        "channels": ["orderbook_delta"],
-                        "market_tickers": [self.ticker]
-                    }
-                }
-                await websocket.send(json.dumps(sub_msg))
-                print(f"📡 Subscribed to {self.ticker}")
-
-                self.ws_task = asyncio.current_task()
-                async for message in websocket:
-                    self.handle_message(message)
-            except asyncio.CancelledError:
-                print("🛑 Disconnecting websocket.")
-                break
-            except ConnectionClosed:
-                print("⚠️ Connection closed, reconnecting...")
-                continue
-            except Exception as e:
-                print(f"❌ WebSocket Error: {e}")
-                await asyncio.sleep(1)
-
-    def handle_message(self, message: str):
-        data = json.loads(message)
-        msg_type = data.get("type")
-        
-        if msg_type == "orderbook_snapshot":
-            msg = data.get("msg", {})
-            self._init_book(msg)
-        elif msg_type == "orderbook_delta":
-            msg = data.get("msg", {})
-            self._update_book(msg)
-
-    def _init_book(self, msg: dict):
-        self.yes_book.clear()
-        self.no_book.clear()
-        
-        for price, qty in msg.get("yes", []):
-            self.yes_book[price] = qty
-            
-        for price, qty in msg.get("no", []):
-            self.no_book[price] = qty
-
-    def _update_book(self, msg: dict):
-        side = msg.get("side")
-        price = msg.get("price")
-        delta = msg.get("delta", 0)
-        
-        book = self.yes_book if side == "yes" else self.no_book
-        
-        current_qty = book.get(price, 0)
-        new_qty = current_qty + delta
-        if new_qty <= 0:
-            book.pop(price, None)
-        else:
-            book[price] = new_qty
-
-    async def execute_trade(self):
-        print("\n--- Evaluating best probability for trade ---")
-        yes_bid = max(self.yes_book.keys()) if self.yes_book else 0
-        no_bid = max(self.no_book.keys()) if self.no_book else 0
-
-        yes_ask = 100 - no_bid if no_bid > 0 else 100
-        no_ask = 100 - yes_bid if yes_bid > 0 else 100
-
-        print(f"Yes Ask: {yes_ask}c | No Ask: {no_ask}c")
-        
-        if yes_ask == 100 and no_ask == 100:
-            print("❌ No valid prices found to trade on.")
-            return
-
-        # Buy the side that has the highest implied probability (meaning highest price)
-        if yes_bid >= no_bid:
-            side_to_buy = "yes"
-            target_price = min(yes_ask, 99)
-            opp_price = 100 - target_price
-            print(f"🎯 Selecting YES side with target ask price {target_price}c.")
-        else:
-            side_to_buy = "no"
-            target_price = min(no_ask, 99)
-            opp_price = 100 - target_price
-            print(f"🎯 Selecting NO side with target ask price {target_price}c.")
-
-        count = 1
-        print(f"🚀 Placing {count} contract(s) BUY order on {self.ticker} for side {side_to_buy} at {target_price}c...")
-        
-        if side_to_buy == "yes":
-            await place_order(
-                ticker=self.ticker,
-                action="buy",
-                side="yes",
-                count=count,
-                yes_price=target_price,
-                no_price=opp_price,
-                order_type="limit"
-            )
-        else:
-            await place_order(
-                ticker=self.ticker,
-                action="buy",
-                side="no",
-                count=count,
-                yes_price=opp_price,
-                no_price=target_price,
-                order_type="limit"
-            )
-
-def main():
-    parser = argparse.ArgumentParser(description="Test Kalshi Trade")
-    parser.add_argument("ticker", type=str, help="Market Ticker to test trading on (e.g., 'KXBTC-24DEC31')")
-    args = parser.parse_args()
-
-    monitor = KalshiTestTradeMonitor(args.ticker)
+async def fetch_test_token():
+    """Fetch an active market token from the CLOB directly to perform a safe limit order test."""
+    url = f"https://clob.polymarket.com/markets"
     
-    print(f"Starting test trade script for {args.ticker}...")
-    try:
-        asyncio.run(monitor.connect_and_trade())
-    except KeyboardInterrupt:
-        print("\nShutting down.")
+    async with aiohttp.ClientSession() as session:
+        print("Fetching a single active market from the CLOB matching engine...")
+        cursor = ""
+        while True:
+            params = {"next_cursor": cursor} if cursor else {}
+            async with session.get(url, params=params) as resp:
+                data = await resp.json()
+                markets = data.get('data', [])
+                if not markets:
+                    print("Could not fetch any CLOB markets.")
+                    return None
+                
+                for market in markets:
+                    # Look for heavily traded active markets
+                    if not market.get("closed") and market.get("active"):
+                        tokens = market.get('tokens', [])
+                        if tokens and len(tokens) >= 2:
+                            raw_token_id = str(tokens[0].get("token_id"))
+                            print(f"Found active CLOB market: {market.get('question')}")
+                            print(f"Testing Trade on YES token ID: {raw_token_id}")
+                            return raw_token_id
+                            
+                cursor = data.get('next_cursor')
+                if not cursor or cursor == "LTE=":
+                    break
+        return None
+
+async def main():
+    print("=== POLYMARKET ARBITRAGE TEST TRADE ===")
+    
+    if not os.getenv("POLYMARKET_APIKEY"):
+        print("ERROR: POLYMARKET_APIKEY not found in .env")
+        return
+        
+    token_id = await fetch_test_token()
+    if not token_id:
+        print("Could not retrieve a valid token ID. Aborting.")
+        return
+        
+    print("\nAttempting to place a test limit BUY order using Good Till Canceled (GTC).")
+    print("Price is set to 1c so it almost certainly will NOT execute.")
+    print("This just validates that the API authentication and order signing process works correctly.\n")
+    
+    # We use a very low limit buy price (1 cent) so it rests on the book and won't match immediately.
+    # We also use GTC so it is accepted by the CLOB resting matcher.
+    resp = await place_order(
+        token_id=token_id,
+        action="buy",
+        count=1, # min 5
+        price_cents=1,  # 1c limit order! VERY SAFE.
+        order_type="good_till_canceled"
+    )
+    
+    if resp and resp.get("success"):
+        print("\n✅ API KEY IS VALID AND ORDER CREATION IS SUCCESSFUL!")
+        print("Response:", resp)
+        print("\n🚨 Please navigate to your Polymarket portfolio and CANCEL this test 1c limit order if you wish.")
+    else:
+        print("\n❌ API REJECTED THE ORDER.")
+        if resp:
+            print(f"Error Message: {resp.get('errorMsg')}")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

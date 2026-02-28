@@ -10,4 +10,5 @@ dependencies = [
     "desktop-notifier>=6.2.0",
     "python-dotenv>=1.2.1",
     "websockets>=16.0",
+    "py_clob_client>=0.1.0"
 ]

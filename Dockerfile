@@ -21,4 +21,4 @@ ENV PYTHONUNBUFFERED=1
 
 # Command to run on startup. 
 # Pre-filled with the arguments you requested.
-CMD ["uv", "run", "python", "kalshi_arb.py", "watch", "--max-hours", "1", "--reset-int", "0.5", "--stake", "1", "--trade"]
+CMD ["uv", "run", "python", "kalshi_arb.py", "watch", "--max-hours", "0.5", "--reset-int", "0.25", "--stake", "1", "--trade"]
