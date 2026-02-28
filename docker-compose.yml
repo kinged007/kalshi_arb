@@ -14,4 +14,5 @@ services:
 
     # Optional: You can override the CMD here if you want to tweak parameters
     # without rebuilding the image
-    command: ["uv", "run", "python", "src/kalshi_arb.py", "watch", "--max-hours", "1", "--reset-int", "0.5", "--stake", "1", "--trade"]
+    # command: ["uv", "run", "python", "src/polly_arb.py", "watch", "--max-hours", "1", "--reset-int", "0.5", "--stake", "1", "--trade"]
+    command: ["uv", "run", "python", "src/polly_arb.py", "watch", "--tags", "15M", "--stake", "1", "--trade"]
