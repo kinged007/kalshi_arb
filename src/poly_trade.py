@@ -56,7 +56,28 @@ def get_clob_client() -> "ClobClient":
     )
     
     return client
-async def place_order(token_id: str, action: str, count: int, price_cents: int, order_type: str = "immediate_or_cancel") -> dict | None:
+
+def align_polymarket_amounts(size: float | int, price_dollars: float) -> float:
+    """
+    Polymarket accepts max 4 decimals for the taker amount (size).
+    The maker amount (size * price_dollars) supports max 2 decimals.
+    This function adjusts the size down so that (size * price_dollars) has exactly 2 decimals.
+    """
+    # Truncate size to 4 decimals
+    size = int(size * 10000) / 10000.0
+    
+    # Calculate Maker amount
+    maker_amount = size * price_dollars
+    maker_amount_rounded = int(maker_amount * 100) / 100.0
+    
+    if abs(maker_amount - maker_amount_rounded) > 1e-8:
+        # Size needs adjustment to make maker amount exact
+        new_size = maker_amount_rounded / price_dollars
+        # Truncate new size to 4 decimals
+        new_size = int(new_size * 10000) / 10000.0
+        return new_size
+    return size
+async def place_order(token_id: str, action: str, count: int | float, price_cents: int, order_type: str = "good_till_canceled") -> dict | None:
     """
     Places an order on Polymarket CLOB via py-clob-client.
     
@@ -75,6 +96,25 @@ async def place_order(token_id: str, action: str, count: int, price_cents: int, 
         price_dollars = price_cents / 100.0
         
         side = BUY if action.lower() == 'buy' else SELL
+        
+        # Apply slippage if we are not using a LIMIT order (resting Maker).
+        # A 2% slippage allows market bids to execute up to 2 cents adrift.
+        if clob_order_type in [OrderType.FAK, OrderType.FOK]:
+            if side == BUY:
+                # Up to 2% worse price maximum
+                price_dollars = min(0.99, price_dollars * 1.02)
+            else:
+                # Will accept up to 2% less
+                price_dollars = max(0.01, price_dollars * 0.98)
+            
+            # Since price_dollars shifted, align it cleanly before mathing the count:
+            price_dollars = round(price_dollars, 2)
+        
+        count = align_polymarket_amounts(count, price_dollars)
+        
+        # When selling, we must ensure we don't try to sell more decimals than we actually bought
+        if side == SELL:
+            count = int(count * 10000) / 10000.0
         
         clob_order_type = OrderType.FAK
         if order_type == "fill_or_kill":
@@ -130,6 +170,22 @@ async def _fetch_best_ask_cents(token_id: str) -> int | None:
     def fetch():
         client = get_clob_client()
         result = client.get_price(token_id, side="BUY")
+        if result and "price" in result:
+            return round(float(result["price"]) * 100)
+        return None
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, fetch)
+
+
+async def _fetch_best_bid_cents(token_id: str) -> int | None:
+    """
+    Fetch the current best bid price (in cents) for a token from the CLOB API.
+    Uses get_price(side="SELL") which returns the highest available bid.
+    """
+    def fetch():
+        client = get_clob_client()
+        result = client.get_price(token_id, side="SELL")
         if result and "price" in result:
             return round(float(result["price"]) * 100)
         return None
@@ -246,7 +302,7 @@ async def place_arb_orders(
                 print(f"❌ Batch order error on {side} leg: {err}")
             return None
 
-        async def _notify_success(act_yes_cents: int, act_no_cents: int, act_count: int) -> None:
+        async def _notify_success(act_yes_cents: int, act_no_cents: int, act_count: int | float) -> None:
             order_ids = [o.get("orderID", "") for o in resp if isinstance(o, dict) and o.get("orderID")]
             profit_per = 100 - act_yes_cents - act_no_cents
             print(f"✅ Polymarket arb position opened! IDs: {order_ids}")
@@ -297,12 +353,121 @@ async def place_arb_orders(
         combined_cost = combined_yes + combined_no
 
         if combined_cost >= 100:
-            suffix = " — ⚠️  UNHEDGED POSITION MAY EXIST. Manual intervention required!" if any_filled else "."
-            print(
-                f"❌ Arb no longer valid at updated prices "
-                f"(YES {combined_yes}c + NO {combined_no}c = {combined_cost}c){suffix}"
-            )
-            return None
+            if not any_filled:
+                print(
+                    f"❌ Arb no longer valid at updated prices "
+                    f"(YES {combined_yes}c + NO {combined_no}c = {combined_cost}c)."
+                )
+                return None
+                
+            # We have an unhedged position and arb is invalid. Start monitoring.
+            missed_idx = list(fak_misses.keys())[0]
+            filled_idx = 1 - missed_idx
+            
+            filled_token = yes_token_id if filled_idx == 0 else no_token_id
+            missed_token = no_token_id if filled_idx == 0 else yes_token_id
+            
+            filled_side = "YES" if filled_idx == 0 else "NO"
+            missed_side = "NO" if filled_idx == 0 else "YES"
+            
+            filled_obj = resp[filled_idx] if isinstance(resp[filled_idx], dict) else {}
+            making = float(filled_obj.get("makingAmount", 0))
+            taking = float(filled_obj.get("takingAmount", 0))
+            
+            if taking > 0:
+                purchased_price_cents = round((making / taking) * 100)
+                actual_count = round(taking, 3)
+            else:
+                purchased_price_cents = yes_price_cents if filled_idx == 0 else no_price_cents
+                actual_count = final_count
+                
+            
+            # Since we will be using LIMIT orders to sit on the book waiting for a fill,
+            # we need to track if we currently have an open order so we don't spam them.
+            active_hedge_order_id = None
+            
+            print(f"⚠️  UNHEDGED POSITION DETECTED! {filled_side} was filled at {purchased_price_cents}c (Count: {actual_count}).")
+            print(f"🔄 Starting continuous price monitoring to secure position hands-free...")
+            
+            while True:
+                await asyncio.sleep(2)
+                missed_ask = await _fetch_best_ask_cents(missed_token)
+                filled_bid = await _fetch_best_bid_cents(filled_token)
+                
+                if missed_ask is None or filled_bid is None:
+                    print(f"⚠️  Could not fetch live prices, retrying...")
+                    continue
+                    
+                combined_price = purchased_price_cents + missed_ask
+                print(f"👀 Monitoring - {filled_side} Bought: {purchased_price_cents}c | {missed_side} Ask: {missed_ask}c | Combined: {combined_price}c | {filled_side} Bid: {filled_bid}c")
+                
+                action_taken = False
+                action_type = ""
+                trade_token = ""
+                trade_action = ""
+                trade_price = 0
+                
+                if filled_bid > purchased_price_cents:
+                    print(f"💰 Cashout Triggered! {filled_side} Bid ({filled_bid}c) > Bought Price ({purchased_price_cents}c). Selling {filled_side} position.")
+                    action_taken = True
+                    action_type = "Sell"
+                    trade_token = filled_token
+                    trade_action = "sell"
+                    trade_price = filled_bid
+                elif combined_price >= 110:
+                    print(f"🚨 Stop Loss Triggered (Combined >= 110c). Buying {missed_side} to cap loss.")
+                    action_taken = True
+                    action_type = "Hedge"
+                    trade_token = missed_token
+                    trade_action = "buy"
+                    trade_price = missed_ask
+                elif combined_price <= 100:
+                    print(f"🎯 Take Profit Triggered (Combined <= 100c). Buying {missed_side} to lock in profit.")
+                    action_taken = True
+                    action_type = "Hedge"
+                    trade_token = missed_token
+                    trade_action = "buy"
+                    trade_price = missed_ask
+                    
+                if action_taken:
+                    # Note on LIMIT orders: Polymarket requires a 5 contract minimum size for GTC Limit orders.
+                    # As a safety, we check actual_count and increase it if necessary to snag the hedge.
+                    safe_count = actual_count
+                    
+                    if safe_count < 5:
+                        print(f"⚠️  Increasing LIMIT order to {trade_action} {trade_token[:8]} from {safe_count} to 5.0 to satisfy Polymarket's Maker minimums!")
+                        safe_count = 5.0
+
+                    print(f"📡 Placing LIMIT order to {trade_action} {trade_token[:8]} at {trade_price}c...")
+                    
+                    result = await place_order(
+                        token_id=trade_token,
+                        action=trade_action,
+                        count=safe_count,
+                        price_cents=trade_price,
+                        order_type="good_till_canceled" # Let it sit on the book
+                    )
+                    
+                    if result and isinstance(result, dict) and not result.get("errorMsg"):
+                        order_id = result.get("orderID")
+                        print(f"✅ LIMIT Order successfully posted! (ID: {order_id}) - Waiting for fill...")
+                        
+                        if action_type == "Hedge":
+                            act_yes = purchased_price_cents if filled_idx == 0 else trade_price
+                            act_no = trade_price if filled_idx == 0 else purchased_price_cents
+                            await _notify_success(act_yes, act_no, safe_count)
+                        else: # Sell
+                            msg = f"✅ Cashed out {filled_side} position via LIMIT order for profit ({purchased_price_cents}c -> {trade_price}c) - Count: {actual_count}"
+                            print(msg)
+                            try:
+                                await notifier.send(title="Polymarket Arb Cashed Out", message=msg)
+                            except Exception:
+                                pass
+                            await notify_tg(msg)
+                        return resp
+                    else:
+                        print(f"❌ Failed to place LIMIT {trade_action} {action_type} order. Retrying...")
+                        continue
 
         print(
             f"✅ Arb still valid at updated prices ({combined_yes}c + {combined_no}c = {combined_cost}c). "
@@ -316,8 +481,16 @@ async def place_arb_orders(
         )
         retry_count = max(final_count, new_min_count)
 
+        # Note on LIMIT orders: Polymarket requires a 5 contract minimum size for GTC Limit orders.
+        # But for 'retrying' the leg immediately we use MARKET/FAK orders which only require a minimum of $1, 
+        # so `retry_count` is still technically valid if the arb is still available.
         for idx, (side, token_id) in fak_misses.items():
             new_price = new_ask_cents[idx]
+            
+            # Since retries often fail for fleeting liquidity, if they fail, they shouldn't just `return None`.
+            # They should actually drop through straight to the unhedged monitoring loop!
+            # So instead of the loop returning None, we'll flag it so it triggers the while-True monitor below.
+            
             print(f"  Retrying {side} leg at {new_price}c × {retry_count} contracts...")
             result = await place_order(
                 token_id=token_id,
@@ -326,9 +499,110 @@ async def place_arb_orders(
                 price_cents=new_price,
             )
             if not result:
-                unhedged = " ⚠️  Unhedged position may exist!" if any_filled else ""
-                print(f"❌ Retry failed on {side} leg.{unhedged}")
-                return None
+                # If retry failed, and we have an unhedged position, force it into the monitor loop!
+                if any_filled:
+                    print(f"❌ Retry failed on {side} leg. ⚠️  Unhedged position confirmed! Falling back to Monitor mode...")
+                    # Calculate unhedged parameters
+                    filled_idx = 1 - idx
+                    
+                    filled_token = yes_token_id if filled_idx == 0 else no_token_id
+                    missed_token = no_token_id if filled_idx == 0 else yes_token_id
+                    
+                    filled_side = "YES" if filled_idx == 0 else "NO"
+                    missed_side = "NO" if filled_idx == 0 else "YES"
+                    
+                    filled_obj = resp[filled_idx] if isinstance(resp[filled_idx], dict) else {}
+                    making = float(filled_obj.get("makingAmount", 0))
+                    taking = float(filled_obj.get("takingAmount", 0))
+                    
+                    if taking > 0:
+                        purchased_price_cents = round((making / taking) * 100)
+                        actual_count = round(taking, 3)
+                    else:
+                        purchased_price_cents = yes_price_cents if filled_idx == 0 else no_price_cents
+                        actual_count = final_count
+                    
+                    print(f"🔄 Starting continuous LIMIT price monitoring to secure position hands-free...")
+                    
+                    while True:
+                        await asyncio.sleep(2)
+                        missed_ask = await _fetch_best_ask_cents(missed_token)
+                        filled_bid = await _fetch_best_bid_cents(filled_token)
+                        
+                        if missed_ask is None or filled_bid is None:
+                            print(f"⚠️  Could not fetch live prices, retrying...")
+                            continue
+                            
+                        combined_price = purchased_price_cents + missed_ask
+                        print(f"👀 Monitoring - {filled_side} Bought: {purchased_price_cents}c | {missed_side} Ask: {missed_ask}c | Combined: {combined_price}c | {filled_side} Bid: {filled_bid}c")
+                        
+                        action_taken = False
+                        action_type = ""
+                        trade_token = ""
+                        trade_action = ""
+                        trade_price = 0
+                        
+                        if filled_bid > purchased_price_cents:
+                            print(f"💰 Cashout Triggered! {filled_side} Bid ({filled_bid}c) > Bought Price ({purchased_price_cents}c). Selling {filled_side} position.")
+                            action_taken = True
+                            action_type = "Sell"
+                            trade_token = filled_token
+                            trade_action = "sell"
+                            trade_price = filled_bid
+                        elif combined_price >= 110:
+                            print(f"🚨 Stop Loss Triggered (Combined >= 110c). Buying {missed_side} to cap loss.")
+                            action_taken = True
+                            action_type = "Hedge"
+                            trade_token = missed_token
+                            trade_action = "buy"
+                            trade_price = missed_ask
+                        elif combined_price <= 100:
+                            print(f"🎯 Take Profit Triggered (Combined <= 100c). Buying {missed_side} to lock in profit.")
+                            action_taken = True
+                            action_type = "Hedge"
+                            trade_token = missed_token
+                            trade_action = "buy"
+                            trade_price = missed_ask
+                            
+                        if action_taken:
+                            safe_count = actual_count
+                            if safe_count < 5:
+                                print(f"⚠️  Increasing LIMIT order to {trade_action} {trade_token[:8]} from {safe_count} to 5.0 to satisfy Polymarket's Maker minimums!")
+                                safe_count = 5.0
+        
+                            print(f"📡 Placing LIMIT order to {trade_action} {trade_token[:8]} at {trade_price}c...")
+                            
+                            limit_result = await place_order(
+                                token_id=trade_token,
+                                action=trade_action,
+                                count=safe_count,
+                                price_cents=trade_price,
+                                order_type="good_till_canceled"
+                            )
+                            
+                            if limit_result and isinstance(limit_result, dict) and not limit_result.get("errorMsg"):
+                                order_id = limit_result.get("orderID")
+                                print(f"✅ LIMIT Order successfully posted! (ID: {order_id}) - Waiting for fill...")
+                                if action_type == "Hedge":
+                                    act_yes = purchased_price_cents if filled_idx == 0 else trade_price
+                                    act_no = trade_price if filled_idx == 0 else purchased_price_cents
+                                    avg_count = max(actual_count, safe_count) 
+                                    await _notify_success(act_yes, act_no, avg_count)
+                                else: # Sell
+                                    msg = f"✅ Cashed out {filled_side} position via LIMIT order for profit ({purchased_price_cents}c -> {trade_price}c)"
+                                    print(msg)
+                                    try:
+                                        await notifier.send(title="Polymarket Arb Cashed Out", message=msg)
+                                    except Exception:
+                                        pass
+                                    await notify_tg(msg)
+                                return resp
+                            else:
+                                print(f"❌ Failed to place LIMIT {trade_action} {action_type} order. Retrying...")
+                                continue
+                else:
+                    print(f"❌ Retry failed on {side} leg.")
+                    return None
 
         await _notify_success(combined_yes, combined_no, retry_count)
         return resp
